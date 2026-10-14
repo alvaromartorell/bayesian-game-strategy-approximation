@@ -3,18 +3,23 @@ from glob import glob
 import pandas as pd
 
 # Expresiones regulares
-HAND_START = re.compile(r"^PokerStars Hand #\d+:")
-SEAT_LINE = re.compile(r"Seat (\d+): (\w+) \((\d+) in chips\)")
-DEALT_LINE = re.compile(r"Dealt to Pluribus \[([2-9TJQKA][shdc]) ([2-9TJQKA][shdc])\]")
-ACTION_LINE = re.compile(r"^(\w+): (folds|checks|calls(?: \d+)?|bets \d+|raises \d+ to \d+)")
-BOARD_LINE = re.compile(r"\*\*\* (FLOP|TURN|RIVER) \*\*\* \[([^\]]+)\]")
-SUMMARY_LINE = re.compile(r"\*\*\* SUMMARY \*\*\*")
+HAND_START = re.compile(r"^PokerStars Hand #(\d+):")
+TABLE_LINE = re.compile(r"^Table 'Pluribus Session (\w+)'.*Seat #(\d+) is the button")
+SEAT_LINE = re.compile(r"^Seat (\d+): (\S+) \((\d+) in chips\)")
+BLIND_LINE = re.compile(r"^(\S+): posts (small|big) blind (\d+)")
+DEALT_LINE = re.compile(r"^Dealt to Pluribus \[([2-9TJQKA][shdc]) ([2-9TJQKA][shdc])\]")
+ACTION_LINE = re.compile(r"^(\S+): (folds|checks|calls (\d+)|bets (\d+)|raises \d+ to (\d+))")
+BOARD_LINE = re.compile(r"^\*\*\* (FLOP|TURN|RIVER) \*\*\*(.*)$")
+CARD = re.compile(r"[2-9TJQKA][shdc]")
+SUMMARY_LINE = re.compile(r"^\*\*\* SUMMARY \*\*\*")
+
+HERO = 'Pluribus'
 
 
 def parse_logs(path_pattern):
     hands = []
-    for path in glob(path_pattern):
-        with open(path, 'r') as f:
+    for path in sorted(glob(path_pattern)):
+        with open(path, 'r', encoding='utf-8') as f:
             lines = f.readlines()
 
         current_hand = []
@@ -23,122 +28,140 @@ def parse_logs(path_pattern):
                 if current_hand:
                     hands.append(current_hand)
                 current_hand = [line.strip()]
-            else:
+            elif current_hand:
                 current_hand.append(line.strip())
         if current_hand:
             hands.append(current_hand)
 
     print(f"Total manos detectadas: {len(hands)}")
-    return _extract_pluribus_actions(hands)
+    records = [r for hand in hands for r in _extract_pluribus_decisions(hand)]
+    print(f"Decisiones de Pluribus extraídas: {len(records)}")
+    return pd.DataFrame(records)
 
 
-def _extract_pluribus_actions(hands):
+def _extract_pluribus_decisions(hand):
+    """
+    Recorre una mano y devuelve un registro por cada decisión de Pluribus con el estado
+    del juego JUSTO ANTES de su acción. El estado se actualiza con la acción después de
+    guardar el registro, para que ninguna variable contenga información de la etiqueta.
+    """
+    hand_id = HAND_START.match(hand[0]).group(1)
+    session, button = None, None
+    start_stack, seat_of = {}, {}
+    street_commit, total_commit = {}, {}   # fichas puestas en esta calle / en toda la mano
+    folded, all_in = set(), set()
+    hole = None
+    board = []
+    street = 0
+    pot = 0
+    current_bet = 0
+    num_raises = 0
+    last_aggressor = None
+    prev_street_aggressor = None
+    bb_player = None
     records = []
 
-    for hand in hands:
-        players = {}
-        board = []
-        street = 'Preflop'
-        hole_cards = ('??', '??')
-        pot = 0
-        last_action = 'none'
-        folded = set()
-        invested=0
-        pluribus_stack=0
-    
+    def acting_order(player):
+        # Preflop habla primero el jugador tras la ciega grande; postflop, el siguiente al botón
+        first_after = seat_of[bb_player] if street == 0 and bb_player else button
+        return (seat_of[player] - first_after - 1) % 10
 
-        for i, line in enumerate(hand):
-            # Extraer asientos y stacks
-            m = SEAT_LINE.match(line)
-            if m:
-                seat, name, stack = m.groups()
-                players[name] = {'seat': int(seat), 'stack': int(stack)}
-                for n in name:
-                    if 'seat' == 1:
-                        stack -= 50
-                        if n == "Pluribus":
-                            invested +=50
-                    if 'seat' == 2:
-                        stack-=100
-                        if n == "Pluribus":
-                            invested +=100
-                if name == "Pluribus":
-                    pluribus_stack = int(stack)
-                    if seat == 1:
-                        invested+=50
-                    elif seat == 2:
-                        stack-=100
-                        invested+=100
+    for line in hand[1:]:
+        m = TABLE_LINE.match(line)
+        if m:
+            session, button = m.group(1), int(m.group(2))
+            continue
 
-                continue
+        m = SEAT_LINE.match(line)
+        if m:
+            seat, name, stack = m.groups()
+            seat_of[name] = int(seat)
+            start_stack[name] = int(stack)
+            street_commit[name] = 0
+            total_commit[name] = 0
+            continue
 
-            # Cartas privadas
-            m = DEALT_LINE.match(line)
-            if m:
-                hole_cards = m.group(1), m.group(2)
-                continue
+        m = BLIND_LINE.match(line)
+        if m:
+            name, kind, amount = m.group(1), m.group(2), int(m.group(3))
+            street_commit[name] += amount
+            total_commit[name] += amount
+            pot += amount
+            current_bet = max(current_bet, amount)
+            if kind == 'big':
+                bb_player = name
+            continue
 
-            # Board
-            m = BOARD_LINE.match(line)
-            if m:
-                street = m.group(1).capitalize()
-                board = m.group(2).split()
-                continue
+        m = DEALT_LINE.match(line)
+        if m:
+            hole = m.group(1), m.group(2)
+            continue
 
-            # Acción
-            m = ACTION_LINE.match(line)
-            if m:
-                actor, action_raw = m.groups()
-                amount=0
-                if actor in folded:
-                    continue
+        m = BOARD_LINE.match(line)
+        if m:
+            board = CARD.findall(m.group(2))   # el turn y el river vienen en un segundo corchete
+            street += 1
+            prev_street_aggressor = last_aggressor
+            street_commit = dict.fromkeys(street_commit, 0)
+            current_bet = 0
+            num_raises = 0
+            last_aggressor = None
+            continue
 
-                # Sumar al bote si la acción tiene cantidad
-                if action_raw.startswith("bets"):
-                    amount = int(action_raw.split()[1])
-                    pot += amount
-                    last_action = 'bet'
-                elif action_raw.startswith("calls"):
-                    try:
-                        amount = int(action_raw.split()[1])
-                        pot += amount
-                    except:
-                        pass
-                    last_action = 'call'
-                elif action_raw.startswith("raises"):
-                    amount = int(action_raw.split()[-1])
-                    pot += amount
-                    last_action = 'raise'
-                elif action_raw == 'folds':
-                    folded.add(actor)
-                    last_action = 'fold'
-                elif action_raw == 'checks':
-                    last_action = 'check'
+        if SUMMARY_LINE.match(line):
+            break
 
-                # Guardar acción de Pluribus
-                if actor == 'Pluribus':
-                    act = action_raw.split()[0]
-                    if act in ['posts', 'Uncalled', 'collected']:
-                        continue
+        m = ACTION_LINE.match(line)
+        if not m or m.group(1) not in seat_of:
+            continue
+        actor, action_raw = m.group(1), m.group(2)
+        action = action_raw.split()[0].rstrip('s')   # folds -> fold, raises -> raise, ...
 
-                    records.append({
-                        'hole1': hole_cards[0],
-                        'hole2': hole_cards[1],
-                        'board': board,
-                        'street': street,
-                        'action': act,
-                        'seat': players.get('Pluribus', {}).get('seat', -1),
-                        'stack': pluribus_stack,
-                        'num_players_active': 6 - len(folded),
-                        'pot_size': pot,
-                        'last_action': last_action,
-                        'invested_by_pluribus': invested,
-                    })
-                    invested += amount
-                    pluribus_stack -= amount
+        # --- Guardar el estado ANTES de aplicar la acción ---
+        if actor == HERO and hole is not None:
+            remaining = {p: start_stack[p] - total_commit[p] for p in seat_of}
+            opponents = [p for p in seat_of if p != HERO and p not in folded]
+            behind = [p for p in opponents
+                      if p not in all_in and acting_order(p) > acting_order(HERO)]
+            records.append({
+                'session': session,
+                'hand_id': hand_id,
+                'hole1': hole[0],
+                'hole2': hole[1],
+                'board': list(board),
+                'street': street,                                    # 0=preflop ... 3=river
+                'position': (seat_of[HERO] - button - 1) % len(seat_of),  # 0=SB ... 5=BTN
+                'pot': pot,
+                'to_call': min(max(current_bet - street_commit[HERO], 0), remaining[HERO]),  # all-in: paga lo que tiene
+                'stack': remaining[HERO],
+                'eff_stack': min(remaining[HERO], max((remaining[p] for p in opponents), default=0)),
+                'num_players_active': len(opponents) + 1,
+                'players_behind': len(behind),
+                'num_raises': num_raises,
+                'aggressor_prev_street': int(prev_street_aggressor == HERO),
+                'action': action,
+            })
 
-            if SUMMARY_LINE.match(line):
-                break
+        # --- Aplicar la acción al estado ---
+        if action == 'fold':
+            folded.add(actor)
+            continue
+        if action == 'check':
+            continue
+        if action == 'call':
+            amount = int(m.group(3))
+        elif action == 'bet':
+            amount = int(m.group(4))
+        else:  # raise: "raises X to Y" -> Y es el total de la calle, no lo que se añade
+            amount = int(m.group(5)) - street_commit[actor]
+        street_commit[actor] += amount
+        total_commit[actor] += amount
+        pot += amount
+        if action in ('bet', 'raise'):
+            current_bet = street_commit[actor]
+            num_raises += 1
+            last_aggressor = actor
+        if total_commit[actor] >= start_stack[actor]:
+            all_in.add(actor)
 
-    print(f"Manos con decisiones de Pluribus extraídas: {len(records)}")
-    return pd.DataFrame(records)
+    return records

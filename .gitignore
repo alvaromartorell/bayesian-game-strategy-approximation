@@ -1,0 +1,10 @@
+# Third-party hand histories (see data/README.md)
+data/pluribus_logs/
+
+# Local working copies of earlier versions
+versiones/
+
+# Python
+__pycache__/
+*.pyc
+.venv/
