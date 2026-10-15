@@ -91,7 +91,7 @@ Solo rangos y relaciones de palo, sin interpretar la jugada.
 | `board_suit_match_low` | nº / 5 | Cartas del board del mismo palo que la carta propia baja. |
 | `board_max_suit` | nº / 5 | Máximo de cartas del board de un mismo palo. |
 
-Las parejas, los proyectos o la fuerza de la mano **no** se dan: el modelo tiene que
+Las parejas, los proyectos o la fuerza de la mano no se dan: el modelo tiene que
 deducirlos comparando rangos y palos.
 
 ---
